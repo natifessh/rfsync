@@ -2,7 +2,7 @@ use blake3::Hash;
 use chrono::{DateTime, Utc};
 use clap::Parser;
 use walkdir::WalkDir;
-mod util;
+
 use std::{
     env::Args, fs::{self, File}, io::{BufReader, Read}, os::unix::thread, path::{Path, PathBuf}, time::{Duration, SystemTime, UNIX_EPOCH}
 };
