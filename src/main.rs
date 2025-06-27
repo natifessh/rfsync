@@ -1,10 +1,11 @@
 use blake3::Hash;
 use chrono::{DateTime, Utc};
-use clap::Parser;
+use clap::{builder::Str, Parser};
 use indicatif::{ProgressBar, ProgressStyle};
+use ssh2::Session;
 use walkdir::WalkDir;
 use std::{
-    env::Args, fs::{self, File}, io::{BufReader, Read}, os::unix::thread, path::{Path, PathBuf}, time::{Duration, SystemTime, UNIX_EPOCH}
+    env::Args, fs::{self, metadata, File}, io::{BufReader, Read, Write}, net::TcpStream, os::unix::thread, path::{Path, PathBuf}, time::{Duration, SystemTime, UNIX_EPOCH}
 };
 use fs_extra::{dir::{self, CopyOptions}, file::copy as copy_file};
 use lazy_static::lazy_static;
@@ -28,12 +29,20 @@ fn bar_init(u:u64){
 pub struct Cmd{
     #[arg(short='s',long="source")]
     pub source:Option<String>,
-    #[arg(short='b',long="backup")]
-    pub backup:Option<String>,
+    #[arg(short='d',long="destination")]
+    pub destination:Option<String>,
     #[arg(short='w',long="watch")]
-    pub  watch:Option<bool>
+    pub  watch:Option<bool>,
+    #[arg(short='r',long="remote")]
+    pub remote:Option<bool>,
+    #[arg(short='u',long="username", requires = "remote")]
+    pub username:Option<String>,
+    #[arg(short='p',long="password", requires = "remote")]
+    pub password:Option<String>,
+    #[arg(short='h',long="host", requires = "remote")]
+    pub host:Option<String>
 }
-fn compute_hash(path: &Path) -> std::io::Result<Hash> {
+fn compute_lhash(path: &Path) -> std::io::Result<Hash> {
     let file = File::open(path)?;
     let mut reader = BufReader::new(file);
     let mut hasher = blake3::Hasher::new();
@@ -53,8 +62,8 @@ fn compare_hash(src: &Path, dst: &Path) -> bool {
         return false;
     }
 
-    let h1 = compute_hash(src).ok();
-    let h2 = compute_hash(dst).ok();
+    let h1 = compute_lhash(src).ok();
+    let h2 = compute_lhash(dst).ok();
 
     match (h1, h2) {
         (Some(a), Some(b)) => a == b,
@@ -112,9 +121,93 @@ fn watcher<'a>(source:&'a str,backup:&'a str){
     PROGRESS_BAR.finish();
 
 }
+fn write_to_remote(src:&str,host:&str  ,dest:&str,paswd:&str,usme:&str){
+    let tcp=TcpStream::connect(host).expect("fail");
+    let mut session=Session::new().expect("fail");
+    let mtd=metadata(src).unwrap();
+    session.set_tcp_stream(tcp);
+    session.handshake().unwrap();
+    session.userauth_password(usme,paswd).expect("auth failure");
+    let mut remote_file=session.scp_send(Path::new(
+        dest
+    ), 0o644, mtd.len(), None).expect("failed file..");
+    let mut local_file = File::open(src).unwrap();
+    let mut buffer = [0u8; 8192];
+    loop {
+        let n = local_file.read(&mut buffer).unwrap();
+        if n == 0 {
+            break;
+        }
+        remote_file.write_all(&buffer[..n]).unwrap();
+    }
+
+    remote_file.send_eof().unwrap();
+    remote_file.wait_eof().unwrap();
+    remote_file.close().unwrap();
+    remote_file.wait_close().unwrap();
+   
+
+}
+fn read_from_remote(src:&str,host:&'static str  ,dest:&str,paswd:&str,usme:&str){
+    let mut tcp=TcpStream::connect(host).expect("conn failure");
+    let mut session=Session::new().unwrap();
+    session.set_tcp_stream(tcp);
+    session.handshake().unwrap();
+    session.userauth_agent(usme).unwrap();
+    let(mut remote_file,stat)=session.scp_recv(Path::new(src)).unwrap();
+    let mut contents=Vec::new();
+    remote_file.read_to_end(&mut contents).unwrap();
+    remote_file.send_eof().unwrap();
+    remote_file.wait_eof().unwrap();
+    remote_file.close().unwrap();
+    remote_file.wait_close().unwrap();
+}
+fn compare_rhash(session:&Session,path:&Path)->std::io::Result<Hash>{
+    let(mut remote_file,_stat)=session.scp_recv(&path).unwrap();
+    let mut hasher=blake3::Hasher::new();
+    let mut buffer=[0u8;8192];
+    loop{
+        let n=remote_file.read(&mut buffer)?;
+        if n==0{
+            break;
+        }
+        hasher.update(&buffer[..n]);
+    }
+    remote_file.send_eof().unwrap();
+    remote_file.wait_eof().unwrap();
+    remote_file.close().unwrap();
+    remote_file.wait_close().unwrap();
+    Ok(hasher.finalize())
+}
+
 fn main() {
      let args = Cmd::parse();
-    match (args.source, args.backup) {
+     if args.remote.unwrap(){
+        match (args.host.unwrap(),args.username.unwrap(),args.password.unwrap(),args.source.unwrap(),args.destination.unwrap()) {
+               (h,u,p,s,d)=>{
+                let mut session=Session::new().unwrap();
+                let tcp=TcpStream::connect(&h).unwrap();
+                session.handshake().unwrap();
+                session.set_tcp_stream(tcp);
+                session.handshake().unwrap();
+                session.userauth_password(&u, &p).unwrap();
+                let dst=Path::new(&d);
+                let src=Path::new(&s);
+                let remote_hash=compare_rhash(&session, &dst).unwrap();
+                let local_hash=compute_lhash(&src).unwrap();
+                let should_copy=remote_hash!=local_hash;
+                if should_copy{
+                    write_to_remote(&s, &h,& d,&p,&u);
+                }
+               },
+
+            _=>todo!()
+            
+        }
+
+     }else{
+
+    match (args.source, args.destination) {
         (Some(src), Some(bcu)) => {
             if args.watch.unwrap_or(false) {
                 loop {
@@ -130,4 +223,17 @@ fn main() {
             std::process::exit(1);
         }
     } 
+     }
+}
+fn remote_watcher(session:&Session,path:&str)->Vec<String>{
+    let mut channel=session.channel_session().unwrap();
+    channel.exec(&format!("find {}",path)).unwrap();
+    let mut s=String::new();
+    channel.read_to_string(&mut s).unwrap();
+    channel.send_eof().unwrap();
+    channel.wait_close().unwrap();
+    s.lines()
+    .map(|line| line.trim().to_string())
+    .filter(|line| !line.is_empty())
+    .collect()
 }
