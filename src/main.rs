@@ -5,7 +5,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use ssh2::Session;
 use walkdir::WalkDir;
 use std::{
-    env::Args, fs::{self, metadata, File}, io::{BufReader, Read, Write}, net::TcpStream, os::unix::thread, path::{Path, PathBuf}, time::{Duration, SystemTime, UNIX_EPOCH}
+    collections::hash_map::Entry, env::Args, fs::{self, metadata, DirEntry, File}, io::{BufReader, Read, Write}, net::TcpStream, os::unix::thread, path::{Path, PathBuf}, time::{Duration, SystemTime, UNIX_EPOCH}
 };
 use fs_extra::{dir::{self, CopyOptions}, file::copy as copy_file};
 use lazy_static::lazy_static;
@@ -73,8 +73,88 @@ fn compare_hash(src: &Path, dst: &Path) -> bool {
 
 fn relative_path(from: &Path, base: &Path) -> PathBuf {
     from.strip_prefix(base).unwrap_or(from).to_path_buf()
+} 
+fn write_to_remote(session:&Session,src:&str,dest:&str){
+    let mut channel = session.channel_session().unwrap();
+    let remote_dir = Path::new(dest).parent().unwrap().to_string_lossy();
+    channel.exec(&format!("mkdir -p '{}'", remote_dir)).unwrap();
+    channel.wait_close().unwrap();
+    let mtd=metadata(src).unwrap();
+    let mut remote_file=session.scp_send(Path::new(
+        dest
+    ), 0o644, mtd.len(), None).expect("failed file..");
+    let mut local_file = File::open(src).unwrap();
+    let mut buffer = [0u8; 8192];
+    loop {
+        let n = local_file.read(&mut buffer).unwrap();
+        if n == 0 {
+            break;
+        }
+        remote_file.write_all(&buffer[..n]).unwrap();
+    }
+
+    remote_file.send_eof().unwrap();
+    remote_file.wait_eof().unwrap();
+    remote_file.close().unwrap();
+    remote_file.wait_close().unwrap();
+   
+
 }
-fn watcher<'a>(source:&'a str,backup:&'a str){
+fn read_from_remote(src:&str,host:&'static str  ,dest:&str,paswd:&str,usme:&str){
+    let mut tcp=TcpStream::connect(host).expect("conn failure");
+    let mut session=Session::new().unwrap();
+    session.set_tcp_stream(tcp);
+    session.handshake().unwrap();
+    session.userauth_agent(usme).unwrap();
+    let(mut remote_file,stat)=session.scp_recv(Path::new(src)).unwrap();
+    let mut contents=Vec::new();
+    remote_file.read_to_end(&mut contents).unwrap();
+    remote_file.send_eof().unwrap();
+    remote_file.wait_eof().unwrap();
+    remote_file.close().unwrap();
+    remote_file.wait_close().unwrap();
+}
+fn compute_rhash(session:&Session,path:&Path)->std::io::Result<Hash>{
+    let(mut remote_file,_stat)=session.scp_recv(&path).unwrap();
+    let mut hasher=blake3::Hasher::new();
+    let mut buffer=[0u8;8192];
+    loop{
+        let n=remote_file.read(&mut buffer)?;
+        if n==0{
+            break;
+        }
+        hasher.update(&buffer[..n]);
+    }
+    remote_file.send_eof().unwrap();
+    remote_file.wait_eof().unwrap();
+    remote_file.close().unwrap();
+    remote_file.wait_close().unwrap();
+    Ok(hasher.finalize())
+}
+fn remote_watcher(session:&Session,path:&str)->Vec<String>{
+    let mut channel=session.channel_session().unwrap();
+    channel.exec(&format!("find {}",path)).unwrap();
+    let mut s=String::new();
+    channel.read_to_string(&mut s).unwrap();
+    channel.send_eof().unwrap();
+    channel.wait_close().unwrap();
+    s.lines()
+    .map(|line| line.trim().to_string())
+    .filter(|line| !line.is_empty())
+    .collect()
+}
+fn compare_local_remote_hash(session:&Session,lpth:&str,rpth:&str)->bool{
+    let local = compute_lhash(Path::new(&lpth));
+    let remote = compute_rhash(session, Path::new(&rpth));
+
+    match (local, remote) {
+        (Ok(l), Ok(r)) => l == r,
+        _ => false,
+    }
+
+}
+
+fn sync_local<'a>(source:&'a str,backup:&'a str){
     let src_root = Path::new(source);
     let backup_root = Path::new(backup);
     let entries: Vec<_> = WalkDir::new(src_root)
@@ -121,64 +201,7 @@ fn watcher<'a>(source:&'a str,backup:&'a str){
     PROGRESS_BAR.finish();
 
 }
-fn write_to_remote(src:&str,host:&str  ,dest:&str,paswd:&str,usme:&str){
-    let tcp=TcpStream::connect(host).expect("fail");
-    let mut session=Session::new().expect("fail");
-    let mtd=metadata(src).unwrap();
-    session.set_tcp_stream(tcp);
-    session.handshake().unwrap();
-    session.userauth_password(usme,paswd).expect("auth failure");
-    let mut remote_file=session.scp_send(Path::new(
-        dest
-    ), 0o644, mtd.len(), None).expect("failed file..");
-    let mut local_file = File::open(src).unwrap();
-    let mut buffer = [0u8; 8192];
-    loop {
-        let n = local_file.read(&mut buffer).unwrap();
-        if n == 0 {
-            break;
-        }
-        remote_file.write_all(&buffer[..n]).unwrap();
-    }
 
-    remote_file.send_eof().unwrap();
-    remote_file.wait_eof().unwrap();
-    remote_file.close().unwrap();
-    remote_file.wait_close().unwrap();
-   
-
-}
-fn read_from_remote(src:&str,host:&'static str  ,dest:&str,paswd:&str,usme:&str){
-    let mut tcp=TcpStream::connect(host).expect("conn failure");
-    let mut session=Session::new().unwrap();
-    session.set_tcp_stream(tcp);
-    session.handshake().unwrap();
-    session.userauth_agent(usme).unwrap();
-    let(mut remote_file,stat)=session.scp_recv(Path::new(src)).unwrap();
-    let mut contents=Vec::new();
-    remote_file.read_to_end(&mut contents).unwrap();
-    remote_file.send_eof().unwrap();
-    remote_file.wait_eof().unwrap();
-    remote_file.close().unwrap();
-    remote_file.wait_close().unwrap();
-}
-fn compare_rhash(session:&Session,path:&Path)->std::io::Result<Hash>{
-    let(mut remote_file,_stat)=session.scp_recv(&path).unwrap();
-    let mut hasher=blake3::Hasher::new();
-    let mut buffer=[0u8;8192];
-    loop{
-        let n=remote_file.read(&mut buffer)?;
-        if n==0{
-            break;
-        }
-        hasher.update(&buffer[..n]);
-    }
-    remote_file.send_eof().unwrap();
-    remote_file.wait_eof().unwrap();
-    remote_file.close().unwrap();
-    remote_file.wait_close().unwrap();
-    Ok(hasher.finalize())
-}
 
 fn main() {
      let args = Cmd::parse();
@@ -187,18 +210,22 @@ fn main() {
                (h,u,p,s,d)=>{
                 let mut session=Session::new().unwrap();
                 let tcp=TcpStream::connect(&h).unwrap();
-                session.handshake().unwrap();
                 session.set_tcp_stream(tcp);
                 session.handshake().unwrap();
                 session.userauth_password(&u, &p).unwrap();
-                let dst=Path::new(&d);
-                let src=Path::new(&s);
-                let remote_hash=compare_rhash(&session, &dst).unwrap();
-                let local_hash=compute_lhash(&src).unwrap();
-                let should_copy=remote_hash!=local_hash;
-                if should_copy{
-                    write_to_remote(&s, &h,& d,&p,&u);
+                let remote_files = remote_watcher(&session, &d);
+                bar_init(remote_files.len() as u64);
+                for remote_path in remote_files {
+                    let rel = Path::new(&remote_path).strip_prefix(&d).unwrap();
+                    let local_path = Path::new(&s).join(rel);
+
+                    if !compare_local_remote_hash(&session, &local_path.to_string_lossy(), &remote_path) {
+                        PROGRESS_BAR.set_message(&format!("Uploading {:?}", rel));
+                        PROGRESS_BAR.inc(1);
+                        write_to_remote(&session, &local_path.to_string_lossy(), &remote_path);
+                    }
                 }
+                PROGRESS_BAR.finish_with_message("Remote sync complete");
                },
 
             _=>todo!()
@@ -207,33 +234,21 @@ fn main() {
 
      }else{
 
-    match (args.source, args.destination) {
+         match (args.source, args.destination) {
         (Some(src), Some(bcu)) => {
             if args.watch.unwrap_or(false) {
                 loop {
-                    watcher(&src, &bcu);
+                    sync_local(&src, &bcu);
                     std::thread::sleep(Duration::from_secs(10));
                 }
             } else {
-                watcher(&src, &bcu);
+                sync_local(&src, &bcu);
             }
         },
         _ => {
             eprintln!("Usag error: --source <path> and --backup <path> are required.");
             std::process::exit(1);
         }
-    } 
+    }  
      }
-}
-fn remote_watcher(session:&Session,path:&str)->Vec<String>{
-    let mut channel=session.channel_session().unwrap();
-    channel.exec(&format!("find {}",path)).unwrap();
-    let mut s=String::new();
-    channel.read_to_string(&mut s).unwrap();
-    channel.send_eof().unwrap();
-    channel.wait_close().unwrap();
-    s.lines()
-    .map(|line| line.trim().to_string())
-    .filter(|line| !line.is_empty())
-    .collect()
 }
