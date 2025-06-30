@@ -29,18 +29,18 @@ fn bar_init(u:u64){
 pub struct Cmd{
     #[arg(short='s',long="source")]
     pub source:Option<String>,
-    #[arg(short='d',long="destination")]
+    #[arg(short='b',long="backup")]
     pub destination:Option<String>,
     #[arg(short='w',long="watch")]
     pub  watch:Option<bool>,
-    #[arg(short='r',long="remote")]
+   /*  #[arg(short='r',long="remote")]
     pub remote:Option<bool>,
     #[arg(short='u',long="username", requires = "remote")]
     pub username:Option<String>,
     #[arg(short='p',long="password", requires = "remote")]
     pub password:Option<String>,
     #[arg(short='h',long="host", requires = "remote")]
-    pub host:Option<String>
+    pub host:Option<String> */
 }
 fn compute_lhash(path: &Path) -> std::io::Result<Hash> {
     let file = File::open(path)?;
@@ -205,7 +205,7 @@ fn sync_local<'a>(source:&'a str,backup:&'a str){
 
 fn main() {
      let args = Cmd::parse();
-     if args.remote.unwrap(){
+     /* if args.remote.unwrap(){
         match (args.host.unwrap(),args.username.unwrap(),args.password.unwrap(),args.source.unwrap(),args.destination.unwrap()) {
                (h,u,p,s,d)=>{
                 let mut session=Session::new().unwrap();
@@ -233,7 +233,7 @@ fn main() {
         }
 
      }else{
-
+ */
          match (args.source, args.destination) {
         (Some(src), Some(bcu)) => {
             if args.watch.unwrap_or(false) {
@@ -251,4 +251,4 @@ fn main() {
         }
     }  
      }
-}
+
