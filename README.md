@@ -9,5 +9,6 @@ cargo run -- -s your/source_dir -b your/dest_dir
 ```
 future plans
 -- remote backup using ssh/scp
+
 -- make the watacher logic with notify 
 ... 
