@@ -1,6 +1,6 @@
 # rfsync
 lightweight local file synchronization tool
-![rfsync](Peek%2025-07-01%23-17.gif)
+![rfsync](demo.gif)
 # usage
 you can use this dummy tool by running:
 ```bash
