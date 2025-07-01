@@ -1,5 +1,5 @@
 # rfsync
-lightweight file synchronization tool
+lightweight local file synchronization tool
 # usage
 you can use this dummy tool by running:
 ```bash
