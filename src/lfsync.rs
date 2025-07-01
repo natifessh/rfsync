@@ -108,7 +108,7 @@ pub fn sync_local(src:&str,dst:&str){
                     eprintln!("Error creating directory {}: {}", dst_dir.display(), e);
                 }
             }
-            PROGRESS_BAR.inc(1); // Increment for directories too, as they are counted in total_files
+            PROGRESS_BAR.inc(1); 
         }
     } 
 );
