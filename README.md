@@ -14,6 +14,6 @@ future plans
 
 -- remote backup using ssh/scp
 
--- make the watacher logic with notify 
+-- make the watcher logic with notify 
 
 ... 
