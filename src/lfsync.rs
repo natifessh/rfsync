@@ -17,6 +17,7 @@ pub mod lfsync{
         progress_bar
     };
 }
+//the command struct to handle commands
 #[derive(Parser,Debug)]
 #[command(version, about, long_about = None)]
 pub struct Cmd{
@@ -27,11 +28,13 @@ pub struct Cmd{
     #[arg(short='w',long="watch")]
     pub  watch:Option<bool>,
 }
+//initialize progessbar
 pub fn bar_init(u:u64){
     PROGRESS_BAR.set_length(u);
     PROGRESS_BAR.set_draw_delta(u.max(1000)/100);
     PROGRESS_BAR.set_position(0);
 }
+//compute file's hash using blake3
 pub fn compute_lhash(path: &Path) -> std::io::Result<Hash> {
     let file = File::open(path)?;
     let mut reader = BufReader::new(file);
@@ -46,6 +49,7 @@ pub fn compute_lhash(path: &Path) -> std::io::Result<Hash> {
     }
     Ok(hasher.finalize())
 }
+//compare hashes
 fn compare_hash(src: &Path, dst: &Path) -> bool {
     if !dst.exists()||!src.exists() {
         return false;
@@ -57,9 +61,11 @@ fn compare_hash(src: &Path, dst: &Path) -> bool {
         _ => false,
     }
 }
+//get relative path
 fn relative_path(from: &Path, base: &Path) -> PathBuf {
     from.strip_prefix(base).unwrap_or(from).to_path_buf()
 }
+//move files to dst if the hashes of files  are different
 pub fn sync_local(src:&str,dst:&str){
     let src_root = Path::new(src);
     let mut modified_files=Arc::new(AtomicUsize::new(0));;
@@ -109,6 +115,8 @@ pub fn sync_local(src:&str,dst:&str){
                 }
             }
             PROGRESS_BAR.inc(1); 
+
+            PROGRESS_BAR.inc(1);
         }
     } 
 );
