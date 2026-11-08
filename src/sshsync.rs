@@ -1,17 +1,22 @@
-//! Remote backup over ssh using SFTP. Auth is via ssh-agent; host keys are
-//! checked against ~/.ssh/known_hosts. Files are compared by size + mtime
-//! (uploads preserve the local mtime), so no remote hashing is needed.
+//! Remote backup over ssh using SFTP. Host keys are checked against
+//! ~/.ssh/known_hosts. Files are compared by size + mtime (uploads preserve the
+//! local mtime), so no remote hashing is needed. Uploads run on several
+//! independent ssh connections in parallel.
 use std::{
     collections::HashSet,
     fs::File,
     io::{self, BufReader},
     net::TcpStream,
     path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Mutex,
+    },
     time::UNIX_EPOCH,
 };
 
-use globset::GlobSet;
 use ssh2::{CheckResult, FileStat, KnownHostFileKind, Session, Sftp};
+use walkdir::DirEntry;
 
 use crate::lfsync::{collect, is_excluded, relative_path, Opts, Stats};
 
@@ -21,6 +26,14 @@ pub struct Target {
     pub host: String,
     pub port: u16,
     pub path: String,
+}
+
+/// how to authenticate: private key file (+ optional passphrase), password, or ssh-agent
+#[derive(Debug, Default)]
+pub struct Auth {
+    pub identity: Option<PathBuf>,
+    /// the key passphrase when `identity` is set, otherwise the ssh password
+    pub secret: Option<String>,
 }
 
 /// parse `user@host:/path`; anything else is a local path
@@ -38,16 +51,20 @@ pub fn parse_target(s: &str, port: u16) -> Option<Target> {
     })
 }
 
-pub fn connect(t: &Target) -> Result<Session, String> {
+pub fn connect(t: &Target, auth: &Auth) -> Result<Session, String> {
     let tcp = TcpStream::connect((t.host.as_str(), t.port))
         .map_err(|e| format!("cannot connect to {}:{}: {}", t.host, t.port, e))?;
     let mut session = Session::new().map_err(|e| e.to_string())?;
     session.set_tcp_stream(tcp);
     session.handshake().map_err(|e| format!("ssh handshake failed: {}", e))?;
     verify_host(&session, t)?;
-    session
-        .userauth_agent(&t.user)
-        .map_err(|e| format!("ssh-agent auth failed for {}: {}", t.user, e))?;
+
+    let result = match (&auth.identity, &auth.secret) {
+        (Some(key), pass) => session.userauth_pubkey_file(&t.user, None, key, pass.as_deref()),
+        (None, Some(pw)) => session.userauth_password(&t.user, pw),
+        (None, None) => session.userauth_agent(&t.user),
+    };
+    result.map_err(|e| format!("authentication failed for {}: {}", t.user, e))?;
     if !session.authenticated() {
         return Err("authentication failed".into());
     }
@@ -114,28 +131,33 @@ fn delete_remote(
     sftp: &Sftp,
     root: &Path,
     cur: &Path,
-    excludes: &GlobSet,
+    opts: &Opts,
     keep: &HashSet<PathBuf>,
-    verbose: bool,
     stats: &mut Stats,
 ) {
     let Ok(children) = sftp.readdir(cur) else { return };
     for (path, st) in children {
         let rel = relative_path(&path, root);
-        if is_excluded(excludes, &rel) {
+        if is_excluded(&opts.excludes, &rel) {
             continue;
         }
         let keep_it = keep.contains(&rel);
         if st.is_dir() {
-            delete_remote(sftp, root, &path, excludes, keep, verbose, stats);
-            if !keep_it && sftp.rmdir(&path).is_ok() {
-                stats.deleted += 1;
+            delete_remote(sftp, root, &path, opts, keep, stats);
+            // directories are cleaned up but not counted (same as local sync)
+            if !keep_it && !opts.dry_run {
+                let _ = sftp.rmdir(&path);
             }
         } else if !keep_it {
+            if opts.dry_run {
+                stats.deleted += 1;
+                println!("would delete {:?}", rel);
+                continue;
+            }
             match sftp.unlink(&path) {
                 Ok(_) => {
                     stats.deleted += 1;
-                    if verbose {
+                    if opts.verbose {
                         println!("deleted {:?}", rel);
                     }
                 }
@@ -148,54 +170,118 @@ fn delete_remote(
     }
 }
 
-pub fn sync_remote(session: &Session, src: &str, rdir: &str, opts: &Opts) -> Result<Stats, String> {
+/// upload one file if the remote copy is missing or differs
+fn process_file(sftp: &Sftp, entry: &DirEntry, src_root: &Path, root: &Path, opts: &Opts, stats: &mut Stats) {
+    let rel = relative_path(entry.path(), src_root);
+    let remote = remote_join(root, &rel);
+    let Ok(meta) = entry.metadata() else {
+        stats.failed += 1;
+        eprintln!("cannot read metadata of {:?}", rel);
+        return;
+    };
+    let mtime = mtime_secs(&meta);
+    let up_to_date = sftp
+        .stat(&remote)
+        .map(|r| r.size == Some(meta.len()) && r.mtime == mtime)
+        .unwrap_or(false);
+    if up_to_date {
+        return;
+    }
+    if opts.dry_run {
+        stats.modified += 1;
+        println!("would upload {:?}", rel);
+        return;
+    }
+    match upload(sftp, entry.path(), &remote, mtime) {
+        Ok(_) => {
+            stats.modified += 1;
+            if opts.verbose {
+                println!("uploaded {:?}", rel);
+            }
+        }
+        Err(e) => {
+            stats.failed += 1;
+            eprintln!("failed to upload {:?}: {}", rel, e);
+        }
+    }
+}
+
+pub fn sync_remote(
+    session: &Session,
+    t: &Target,
+    auth: &Auth,
+    src: &str,
+    opts: &Opts,
+    jobs: usize,
+) -> Result<Stats, String> {
     let src_root = Path::new(src);
-    let root = Path::new(rdir);
+    let root = Path::new(&t.path);
     let sftp = session.sftp().map_err(|e| e.to_string())?;
-    ensure_dir(&sftp, root)?;
+    if !opts.dry_run {
+        ensure_dir(&sftp, root)?;
+    }
 
     let entries = collect(src_root, &opts.excludes);
     let mut stats = Stats { checked: entries.len(), ..Default::default() };
 
-    for entry in &entries {
-        let rel = relative_path(entry.path(), src_root);
-        let remote = remote_join(root, &rel);
-        if entry.file_type().is_dir() {
-            if let Err(e) = ensure_dir(&sftp, &remote) {
+    // directories first (sequential, cheap), so uploads never race on mkdir
+    if !opts.dry_run {
+        for e in entries.iter().filter(|e| e.file_type().is_dir()) {
+            let remote = remote_join(root, &relative_path(e.path(), src_root));
+            if let Err(err) = ensure_dir(&sftp, &remote) {
                 stats.failed += 1;
-                eprintln!("{}", e);
-            }
-            continue;
-        }
-        let Ok(meta) = entry.metadata() else {
-            stats.failed += 1;
-            continue;
-        };
-        let mtime = mtime_secs(&meta);
-        let up_to_date = sftp
-            .stat(&remote)
-            .map(|r| r.size == Some(meta.len()) && r.mtime == mtime)
-            .unwrap_or(false);
-        if up_to_date {
-            continue;
-        }
-        match upload(&sftp, entry.path(), &remote, mtime) {
-            Ok(_) => {
-                stats.modified += 1;
-                if opts.verbose {
-                    println!("uploaded {:?}", rel);
-                }
-            }
-            Err(e) => {
-                stats.failed += 1;
-                eprintln!("failed to upload {:?}: {}", rel, e);
+                eprintln!("{}", err);
             }
         }
     }
 
+    // files: N workers, each on its own connection, pulling from a shared counter
+    let files: Vec<&DirEntry> = entries.iter().filter(|e| e.file_type().is_file()).collect();
+    let next = AtomicUsize::new(0);
+    let done = AtomicUsize::new(0);
+    let merged = Mutex::new(Stats::default());
+    let workers = jobs.min(files.len());
+
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| {
+                let sess = match connect(t, auth) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("worker connection failed: {}", e);
+                        return;
+                    }
+                };
+                let sftp = match sess.sftp() {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("worker sftp failed: {}", e);
+                        return;
+                    }
+                };
+                let mut local = Stats::default();
+                loop {
+                    let i = next.fetch_add(1, Ordering::SeqCst);
+                    let Some(entry) = files.get(i) else { break };
+                    process_file(&sftp, entry, src_root, root, opts, &mut local);
+                    done.fetch_add(1, Ordering::SeqCst);
+                }
+                let mut m = merged.lock().unwrap();
+                m.modified += local.modified;
+                m.failed += local.failed;
+            });
+        }
+    });
+
+    let m = merged.into_inner().unwrap();
+    stats.modified += m.modified;
+    stats.failed += m.failed;
+    // files nobody got to (e.g. every worker failed to connect) count as failures
+    stats.failed += files.len().saturating_sub(done.load(Ordering::SeqCst));
+
     if opts.delete {
         let keep: HashSet<PathBuf> = entries.iter().map(|e| relative_path(e.path(), src_root)).collect();
-        delete_remote(&sftp, root, root, &opts.excludes, &keep, opts.verbose, &mut stats);
+        delete_remote(&sftp, root, root, opts, &keep, &mut stats);
     }
     Ok(stats)
 }
@@ -219,5 +305,11 @@ mod tests {
         assert!(parse_target("./a@b", 22).is_none());
         assert!(parse_target("backup", 22).is_none());
         assert!(parse_target("user@host:", 22).is_none());
+    }
+
+    #[test]
+    fn remote_join_uses_forward_slashes() {
+        let p = remote_join(Path::new("/srv/bk"), Path::new("a/b/c.txt"));
+        assert_eq!(p, PathBuf::from("/srv/bk/a/b/c.txt"));
     }
 }
