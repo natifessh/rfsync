@@ -7,7 +7,6 @@ use std::{
 };
 
 use blake3::Hash;
-use clap::Parser;
 use fs_extra::file::copy as copy_file;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use indicatif::{ProgressBar, ProgressStyle};
@@ -26,41 +25,12 @@ lazy_static! {
     };
 }
 
-/// the command struct to handle commands
-#[derive(Parser, Debug)]
-#[command(version, about, long_about = None)]
-pub struct Cmd {
-    /// local source directory
-    #[arg(short = 's', long = "source")]
-    pub source: String,
-    /// destination: a local directory, or user@host:/remote/path for ssh (sftp) backup
-    #[arg(short = 'b', long = "backup")]
-    pub destination: String,
-    /// keep running and re-sync whenever the source changes
-    #[arg(short = 'w', long = "watch")]
-    pub watch: bool,
-    /// show a progress bar (local) / per-file output (remote)
-    #[arg(short = 'v', long = "verbose")]
-    pub verbose: bool,
-    /// glob pattern to skip, matched against every path component (repeatable), e.g. -e target -e '*.log'
-    #[arg(short = 'e', long = "exclude")]
-    pub exclude: Vec<String>,
-    /// delete files in the destination that no longer exist in the source
-    #[arg(long = "delete")]
-    pub delete: bool,
-    /// quiet period in ms to batch file events in watch mode
-    #[arg(long = "debounce-ms", default_value_t = 500)]
-    pub debounce_ms: u64,
-    /// ssh port for remote destinations
-    #[arg(long = "port", default_value_t = 22)]
-    pub port: u16,
-}
-
 /// options shared by local and remote sync
 pub struct Opts {
     pub excludes: GlobSet,
     pub delete: bool,
     pub verbose: bool,
+    pub dry_run: bool,
 }
 
 #[derive(Default, Debug, PartialEq, Eq)]
@@ -72,11 +42,18 @@ pub struct Stats {
 }
 
 impl Stats {
-    pub fn report(&self) {
-        println!(
-            "✅ Backup completed. {} checked, {} modified, {} deleted, {} failed.",
-            self.checked, self.modified, self.deleted, self.failed
-        );
+    pub fn report(&self, dry_run: bool) {
+        if dry_run {
+            println!(
+                "🔎 Dry run: {} checked, {} would be copied, {} would be deleted, {} failed.",
+                self.checked, self.modified, self.deleted, self.failed
+            );
+        } else {
+            println!(
+                "✅ Backup completed. {} checked, {} modified, {} deleted, {} failed.",
+                self.checked, self.modified, self.deleted, self.failed
+            );
+        }
     }
 }
 
@@ -143,20 +120,46 @@ pub fn collect(root: &Path, excludes: &GlobSet) -> Vec<walkdir::DirEntry> {
         .collect()
 }
 
-pub fn validate_paths(src: &str, dst: &str) -> Result<(), String> {
+/// canonicalize a path that may not exist yet: resolve the deepest existing
+/// ancestor and re-append the missing components
+fn resolve_path(p: &Path) -> std::io::Result<PathBuf> {
+    let mut missing = Vec::new();
+    let mut cur = p.to_path_buf();
+    loop {
+        match cur.canonicalize() {
+            Ok(mut out) => {
+                out.extend(missing.iter().rev());
+                return Ok(out);
+            }
+            Err(e) => match (cur.file_name().map(|n| n.to_owned()), cur.parent()) {
+                (Some(name), Some(parent)) => {
+                    missing.push(name);
+                    cur = if parent.as_os_str().is_empty() {
+                        PathBuf::from(".")
+                    } else {
+                        parent.to_path_buf()
+                    };
+                }
+                _ => return Err(e),
+            },
+        }
+    }
+}
+
+/// check the source exists and the destination is not inside it; create the
+/// destination when `create` is set (never in a dry run)
+pub fn validate_paths(src: &str, dst: &str, create: bool) -> Result<(), String> {
     let src_root = Path::new(src);
     if !src_root.is_dir() {
         return Err(format!("source '{}' is not an existing directory", src));
     }
-    let existed = Path::new(dst).exists();
-    std::fs::create_dir_all(dst).map_err(|e| format!("cannot create '{}': {}", dst, e))?;
     let s = src_root.canonicalize().map_err(|e| e.to_string())?;
-    let d = Path::new(dst).canonicalize().map_err(|e| e.to_string())?;
+    let d = resolve_path(Path::new(dst)).map_err(|e| format!("bad destination '{}': {}", dst, e))?;
     if d.starts_with(&s) {
-        if !existed {
-            let _ = std::fs::remove_dir(dst); // undo; only removes if empty
-        }
         return Err("destination must not be inside the source directory".into());
+    }
+    if create {
+        std::fs::create_dir_all(dst).map_err(|e| format!("cannot create '{}': {}", dst, e))?;
     }
     Ok(())
 }
@@ -167,6 +170,7 @@ fn delete_extraneous(
     excludes: &GlobSet,
     keep: &HashSet<PathBuf>,
     verbose: bool,
+    dry_run: bool,
     stats: &mut Stats,
 ) {
     // contents_first so files go before the directories that hold them
@@ -180,10 +184,14 @@ fn delete_extraneous(
             continue;
         }
         if e.file_type().is_dir() {
-            // may legitimately be non-empty if it still holds excluded files
-            if std::fs::remove_dir(e.path()).is_ok() {
-                stats.deleted += 1;
+            // directories are cleaned up but not counted; one may legitimately
+            // stay behind if it still holds excluded files
+            if !dry_run {
+                let _ = std::fs::remove_dir(e.path());
             }
+        } else if dry_run {
+            stats.deleted += 1;
+            println!("would delete {:?}", rel);
         } else {
             match std::fs::remove_file(e.path()) {
                 Ok(_) => {
@@ -209,7 +217,7 @@ pub fn sync_local(src: &str, dst: &str, opts: &Opts) -> Stats {
     let failed = AtomicUsize::new(0);
 
     let entries = collect(src_root, &opts.excludes);
-    let show_bar = opts.verbose;
+    let show_bar = opts.verbose && !opts.dry_run;
     if show_bar {
         bar_init(entries.len() as u64);
     }
@@ -228,7 +236,10 @@ pub fn sync_local(src: &str, dst: &str, opts: &Opts) -> Stats {
                     rel_path
                 ));
             }
-            if should_copy {
+            if should_copy && opts.dry_run {
+                modified.fetch_add(1, Ordering::Relaxed);
+                println!("would copy {:?}", rel_path);
+            } else if should_copy {
                 let result = match dst_path.parent() {
                     Some(parent) => std::fs::create_dir_all(parent).map_err(|e| e.to_string()),
                     None => Ok(()),
@@ -254,6 +265,8 @@ pub fn sync_local(src: &str, dst: &str, opts: &Opts) -> Stats {
                     }
                 }
             }
+        } else if opts.dry_run {
+            // directories are created implicitly; nothing to report
         } else if let Err(e) = std::fs::create_dir_all(&dst_path) {
             failed.fetch_add(1, Ordering::Relaxed);
             eprintln!("failed to create {:?}: {}", rel_path, e);
@@ -275,7 +288,7 @@ pub fn sync_local(src: &str, dst: &str, opts: &Opts) -> Stats {
             .iter()
             .map(|e| relative_path(e.path(), src_root))
             .collect();
-        delete_extraneous(backup_root, &opts.excludes, &keep, opts.verbose, &mut stats);
+        delete_extraneous(backup_root, &opts.excludes, &keep, opts.verbose, opts.dry_run, &mut stats);
     }
 
     if show_bar {
@@ -299,7 +312,12 @@ mod tests {
             excludes: build_excludes(&pats).unwrap(),
             delete,
             verbose: false,
+            dry_run: false,
         }
+    }
+
+    fn dry(excludes: &[&str], delete: bool) -> Opts {
+        Opts { dry_run: true, ..opts(excludes, delete) }
     }
 
     fn run(s: &Path, d: &Path, o: &Opts) -> Stats {
@@ -369,7 +387,7 @@ mod tests {
         assert!(!d.join("b").exists());
         assert!(!d.join("olddir").exists());
         assert!(d.join("keep.log").exists());
-        assert_eq!(st.deleted, 3); // b, olddir/z, olddir
+        assert_eq!(st.deleted, 2); // b and olddir/z (directories are not counted)
     }
 
     #[test]
@@ -389,10 +407,56 @@ mod tests {
         let s = t.path().join("s");
         fs::create_dir_all(&s).unwrap();
         let inside = s.join("x");
-        assert!(validate_paths(s.to_str().unwrap(), inside.to_str().unwrap()).is_err());
+        assert!(validate_paths(s.to_str().unwrap(), inside.to_str().unwrap(), true).is_err());
         assert!(!inside.exists());
-        assert!(validate_paths("/definitely/not/here", t.path().to_str().unwrap()).is_err());
-        assert!(validate_paths(s.to_str().unwrap(), t.path().join("ok").to_str().unwrap()).is_ok());
+        assert!(validate_paths("/definitely/not/here", t.path().to_str().unwrap(), true).is_err());
+        assert!(validate_paths(s.to_str().unwrap(), t.path().join("ok").to_str().unwrap(), true).is_ok());
+    }
+
+    #[test]
+    fn validate_without_create_leaves_no_trace() {
+        let t = tempdir().unwrap();
+        let s = t.path().join("s");
+        fs::create_dir_all(&s).unwrap();
+        let new_dst = t.path().join("a/b/c");
+        assert!(validate_paths(s.to_str().unwrap(), new_dst.to_str().unwrap(), false).is_ok());
+        assert!(!t.path().join("a").exists());
+        // still catches nested-in-source destinations that don't exist yet
+        let nested = s.join("x/y");
+        assert!(validate_paths(s.to_str().unwrap(), nested.to_str().unwrap(), false).is_err());
+        assert!(!s.join("x").exists());
+    }
+
+    #[test]
+    fn dry_run_changes_nothing_but_reports() {
+        let t = tempdir().unwrap();
+        let (s, d) = (t.path().join("s"), t.path().join("d"));
+        fs::create_dir_all(&s).unwrap();
+        fs::write(s.join("new"), "n").unwrap();
+        fs::write(s.join("same"), "s").unwrap();
+        run(&s, &d, &opts(&[], false));
+        fs::write(s.join("new2"), "n2").unwrap();
+        fs::write(d.join("stale"), "x").unwrap();
+        fs::remove_file(d.join("same")).unwrap();
+        fs::write(d.join("same"), "DIFFERENT").unwrap();
+
+        let st = run(&s, &d, &dry(&[], true));
+        assert_eq!(st.modified, 2); // new2 + same
+        assert_eq!(st.deleted, 1); // stale
+        assert!(!d.join("new2").exists());
+        assert!(d.join("stale").exists());
+        assert_eq!(fs::read_to_string(d.join("same")).unwrap(), "DIFFERENT");
+    }
+
+    #[test]
+    fn dry_run_does_not_create_destination() {
+        let t = tempdir().unwrap();
+        let (s, d) = (t.path().join("s"), t.path().join("d"));
+        fs::create_dir_all(s.join("sub")).unwrap();
+        fs::write(s.join("sub/f"), "f").unwrap();
+        let st = run(&s, &d, &dry(&[], false));
+        assert_eq!(st.modified, 1);
+        assert!(!d.exists());
     }
 
     #[test]
